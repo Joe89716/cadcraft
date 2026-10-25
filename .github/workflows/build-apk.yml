@@ -1,0 +1,135 @@
+name: Build CADCraft APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: Setup Rust & WASM
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+
+      - name: Install Trunk & Image Tools
+        run: |
+          cargo install --locked trunk
+          sudo apt-get update && sudo apt-get install -y imagemagick
+
+      # تعديل قيود كروت الشاشة في مكتبات Rust لتناسب التابلت
+      - name: Fetch and Patch WGPU Limits
+        run: |
+          cargo fetch --target wasm32-unknown-unknown
+          find /home/runner/.cargo/registry/src/ -type f -name "*.rs" -exec sed -i 's/max_texture_dimension_2d: 8192/max_texture_dimension_2d: 4096/g' {} + || true
+          find /home/runner/.cargo/registry/src/ -type f -name "*.rs" -exec sed -i 's/8192/4096/g' {} + || true
+          find . -type f -name "*.rs" -exec sed -i 's/max_texture_dimension_2d: 8192/max_texture_dimension_2d: 4096/g' {} + || true
+          find . -type f -name "*.rs" -exec sed -i 's/8192/4096/g' {} + || true
+
+      - name: Build Web Bundle
+        env:
+          RUSTFLAGS: "-A warnings"
+        run: |
+          cd apps/cadcraft-web
+          trunk build --release
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p www
+          if [ -d "dist/web" ]; then
+            cp -r dist/web/* www/
+          elif [ -d "dist" ]; then
+            cp -r dist/* www/
+          fi
+
+      - name: Setup Capacitor
+        run: |
+          npm init -y
+          npm install @capacitor/core @capacitor/cli @capacitor/android
+          npx cap init "CADCraft" "com.craft.cadcraft" --web-dir "www"
+          npx cap add android
+          npx cap sync android
+
+      - name: Enable Hardware Acceleration
+        run: |
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          sed -i 's/<application /<application android:hardwareAccelerated="true" android:largeHeap="true" /g' "$MANIFEST"
+
+      - name: Setup CADCraft Official Icon
+        run: |
+          ICON_SRC=""
+          if [ -f "assets/app-icon/cadcraft-1024.png" ]; then
+            ICON_SRC="assets/app-icon/cadcraft-1024.png"
+          elif [ -f "assets/app-icon/cadcraft-macos-512.png" ]; then
+            ICON_SRC="assets/app-icon/cadcraft-macos-512.png"
+          elif [ -f "assets/app-icon/icon.png" ]; then
+            ICON_SRC="assets/app-icon/icon.png"
+          fi
+
+          if [ -n "$ICON_SRC" ]; then
+            RES_DIR="android/app/src/main/res"
+            rm -rf "$RES_DIR"/mipmap-anydpi-v26
+            rm -f "$RES_DIR"/drawable/ic_launcher_background.xml
+            rm -f "$RES_DIR"/drawable-v24/ic_launcher_foreground.xml
+
+            for entry in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+              folder="${entry%%:*}"
+              size="${entry##*:}"
+              mkdir -p "$RES_DIR/mipmap-$folder"
+              convert "$ICON_SRC" -resize "${size}x${size}" "$RES_DIR/mipmap-$folder/ic_launcher.png"
+              convert "$ICON_SRC" -resize "${size}x${size}" "$RES_DIR/mipmap-$folder/ic_launcher_round.png"
+              convert "$ICON_SRC" -resize "${size}x${size}" "$RES_DIR/mipmap-$folder/ic_launcher_foreground.png"
+            done
+          fi
+
+      - name: Enforce App Name
+        run: |
+          sed -i 's/<string name="app_name">.*<\/string>/<string name="app_name">CADCraft<\/string>/g' android/app/src/main/res/values/strings.xml
+          sed -i 's/<string name="title_activity_main">.*<\/string>/<string name="title_activity_main">CADCraft<\/string>/g' android/app/src/main/res/values/strings.xml
+
+      - name: Fix Kotlin Duplicate Classes
+        run: |
+          cat << 'EOF' >> android/app/build.gradle
+
+          configurations.all {
+              resolutionStrategy.eachDependency { DependencyResolveDetails details ->
+                  if (details.requested.group == 'org.jetbrains.kotlin') {
+                      details.useVersion '1.8.22'
+                  }
+              }
+          }
+          dependencies {
+              constraints {
+                  implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22") {
+                      because("align with kotlin-stdlib")
+                  }
+                  implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22") {
+                      because("align with kotlin-stdlib")
+                  }
+              }
+          }
+          EOF
+
+      - name: Build Android Debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK File
+        uses: actions/upload-artifact@v4
+        with:
+          name: CADCraft-Offline-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
